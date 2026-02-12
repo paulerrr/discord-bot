@@ -16,6 +16,13 @@ log = logging.getLogger(__name__)
 DB_PATH = "messages.db"
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
 
+_raw_guild_ids = os.getenv("GUILD_IDS", "").strip()
+GUILD_IDS = (
+    {int(gid) for gid in _raw_guild_ids.split(",") if gid.strip()}
+    if _raw_guild_ids
+    else None
+)
+
 client = discord.Client()
 
 os.makedirs("media", exist_ok=True)
@@ -93,9 +100,17 @@ async def on_ready():
     log.info("Logged in as %s", client.user)
 
 
+def _guild_allowed(guild):
+    if GUILD_IDS is None or guild is None:
+        return True
+    return guild.id in GUILD_IDS
+
+
 @client.event
 async def on_message(message):
     if message.author.id == client.user.id:
+        return
+    if not _guild_allowed(message.guild):
         return
 
     attachment_names = (
@@ -133,6 +148,8 @@ async def on_message(message):
 
 @client.event
 async def on_message_delete(message):
+    if not _guild_allowed(message.guild):
+        return
     try:
         async with db_lock:
             async with db.execute(
@@ -145,8 +162,10 @@ async def on_message_delete(message):
         if row:
             author, channel, content, attachments, created_at = row
 
+            guild_name = message.guild.name if message.guild else "DM"
             log_text = (
                 f"**Message Deleted**\n"
+                f"**Server:** {guild_name}\n"
                 f"**Author:** {author}\n"
                 f"**Channel:** {channel}\n"
                 f"**Content:** {content or '*empty*'}\n"
@@ -173,6 +192,8 @@ async def on_message_delete(message):
 
 @client.event
 async def on_message_edit(before, after):
+    if not _guild_allowed(before.guild):
+        return
     try:
         async with db_lock:
             async with db.execute(
@@ -186,12 +207,15 @@ async def on_message_edit(before, after):
         if old_content == after.content:
             return
 
+        guild_name = after.guild.name if after.guild else "DM"
         log_text = (
             f"**Message Edited**\n"
+            f"**Server:** {guild_name}\n"
             f"**Author:** {after.author}\n"
             f"**Channel:** {after.channel}\n"
             f"**Before:** {old_content or '*empty*'}\n"
-            f"**After:** {after.content or '*empty*'}"
+            f"**After:** {after.content or '*empty*'}\n"
+            f"{after.jump_url}"
         )
 
         await log_queue.put((log_text, None))
