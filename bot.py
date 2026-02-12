@@ -42,6 +42,9 @@ async def on_ready():
 
 @client.event
 async def on_message(message):
+    if message.author.id == client.user.id:
+        return
+
     attachment_names = (
         ",".join(a.filename for a in message.attachments)
         if message.attachments
