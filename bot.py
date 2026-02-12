@@ -191,6 +191,65 @@ async def on_message_delete(message):
 
 
 @client.event
+async def on_bulk_message_delete(messages):
+    if not messages:
+        return
+    if not _guild_allowed(messages[0].guild):
+        return
+
+    guild_name = messages[0].guild.name if messages[0].guild else "DM"
+    channel = str(messages[0].channel)
+    msg_ids = [m.id for m in messages]
+
+    try:
+        placeholders = ",".join("?" * len(msg_ids))
+        async with db_lock:
+            async with db.execute(
+                f"SELECT message_id, author, content, attachments, created_at "
+                f"FROM messages WHERE message_id IN ({placeholders})",
+                msg_ids,
+            ) as cursor:
+                rows = {r[0]: r[1:] for r in await cursor.fetchall()}
+
+        lines = [
+            f"**Bulk Delete — {len(messages)} messages**",
+            f"**Server:** {guild_name}",
+            f"**Channel:** {channel}",
+            "",
+        ]
+
+        all_files = []
+        for msg in messages:
+            if msg.id in rows:
+                author, content, attachments, created_at = rows[msg.id]
+            else:
+                author = str(msg.author) if msg.author else "Unknown"
+                content = msg.content or ""
+                attachments = ""
+                created_at = str(msg.created_at) if msg.created_at else "?"
+
+            lines.append(f"[{created_at}] {author}: {content or '*empty*'}")
+
+            if attachments:
+                for filename in attachments.split(","):
+                    path = f"media/{msg.id}_{filename}"
+                    if os.path.exists(path):
+                        all_files.append(discord.File(path, filename=filename))
+
+        await log_queue.put(("\n".join(lines), all_files or None))
+
+        if rows:
+            async with db_lock:
+                await db.execute(
+                    f"DELETE FROM messages WHERE message_id IN ({placeholders})",
+                    msg_ids,
+                )
+                await db.commit()
+    except Exception:
+        log.exception("Failed to handle bulk message deletion")
+
+
+@client.event
 async def on_message_edit(before, after):
     if not _guild_allowed(before.guild):
         return
