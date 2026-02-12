@@ -1,0 +1,6 @@
+.env
+venv/
+media/
+logs/
+messages.db
+__pycache__/
