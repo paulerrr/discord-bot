@@ -13,7 +13,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-DB_PATH = "messages.db"
+DB_PATH = os.getenv("DB_PATH", "messages.db")
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
 
 _raw_guild_ids = os.getenv("GUILD_IDS", "").strip()
