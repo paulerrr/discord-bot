@@ -20,6 +20,32 @@ client = discord.Client()
 
 os.makedirs("media", exist_ok=True)
 
+DISCORD_MAX_LEN = 2000
+
+
+async def send_long_message(channel, text, files=None):
+    """Send a message, splitting into multiple if over 2000 chars."""
+    if len(text) <= DISCORD_MAX_LEN:
+        await channel.send(text, files=files)
+        return
+
+    chunks = []
+    while text:
+        if len(text) <= DISCORD_MAX_LEN:
+            chunks.append(text)
+            break
+        split_at = text.rfind("\n", 0, DISCORD_MAX_LEN)
+        if split_at == -1:
+            split_at = DISCORD_MAX_LEN
+        chunks.append(text[:split_at])
+        text = text[split_at:].lstrip("\n")
+
+    for i, chunk in enumerate(chunks):
+        if i == 0 and files:
+            await channel.send(chunk, files=files)
+        else:
+            await channel.send(chunk)
+
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -109,7 +135,7 @@ async def on_message_delete(message):
 
                 log_channel = client.get_channel(LOG_CHANNEL_ID)
                 if log_channel:
-                    await log_channel.send(log_text, files=files)
+                    await send_long_message(log_channel, log_text, files=files)
 
                 await db.execute(
                     "DELETE FROM messages WHERE message_id = ?", (message.id,)
@@ -144,7 +170,7 @@ async def on_message_edit(before, after):
 
             log_channel = client.get_channel(LOG_CHANNEL_ID)
             if log_channel:
-                await log_channel.send(log_text)
+                await send_long_message(log_channel, log_text)
 
             await db.execute(
                 "UPDATE messages SET content = ? WHERE message_id = ?",
