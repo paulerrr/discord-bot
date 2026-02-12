@@ -1,8 +1,8 @@
+import asyncio
 import discord
 import os
 import logging
 import aiosqlite
-from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -22,33 +22,60 @@ os.makedirs("media", exist_ok=True)
 
 DISCORD_MAX_LEN = 2000
 
+# Module-level state (initialized once in on_ready)
+db = None
+db_lock = None
+log_queue = None
+api_semaphore = None
+_log_worker_task = None
+
 
 async def send_long_message(channel, text, files=None):
     """Send a message, splitting into multiple if over 2000 chars."""
-    if len(text) <= DISCORD_MAX_LEN:
-        await channel.send(text, files=files)
-        return
-
-    chunks = []
-    while text:
+    async with api_semaphore:
         if len(text) <= DISCORD_MAX_LEN:
-            chunks.append(text)
-            break
-        split_at = text.rfind("\n", 0, DISCORD_MAX_LEN)
-        if split_at == -1:
-            split_at = DISCORD_MAX_LEN
-        chunks.append(text[:split_at])
-        text = text[split_at:].lstrip("\n")
+            await channel.send(text, files=files)
+            return
 
-    for i, chunk in enumerate(chunks):
-        if i == 0 and files:
-            await channel.send(chunk, files=files)
-        else:
-            await channel.send(chunk)
+        chunks = []
+        while text:
+            if len(text) <= DISCORD_MAX_LEN:
+                chunks.append(text)
+                break
+            split_at = text.rfind("\n", 0, DISCORD_MAX_LEN)
+            if split_at == -1:
+                split_at = DISCORD_MAX_LEN
+            chunks.append(text[:split_at])
+            text = text[split_at:].lstrip("\n")
+
+        for i, chunk in enumerate(chunks):
+            if i == 0 and files:
+                await channel.send(chunk, files=files)
+            else:
+                await channel.send(chunk)
 
 
-async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
+async def log_worker():
+    """Background worker that sends log messages at ~2/sec."""
+    while True:
+        text, files = await log_queue.get()
+        try:
+            log_channel = client.get_channel(LOG_CHANNEL_ID)
+            if log_channel:
+                await send_long_message(log_channel, text, files=files)
+        except Exception:
+            log.exception("log_worker failed to send message")
+        finally:
+            log_queue.task_done()
+        await asyncio.sleep(0.5)
+
+
+@client.event
+async def on_ready():
+    global db, db_lock, log_queue, api_semaphore, _log_worker_task
+
+    if db is None:
+        db = await aiosqlite.connect(DB_PATH)
         await db.execute("""CREATE TABLE IF NOT EXISTS messages (
             message_id INTEGER PRIMARY KEY,
             author TEXT,
@@ -58,11 +85,11 @@ async def init_db():
             created_at TEXT
         )""")
         await db.commit()
+        db_lock = asyncio.Lock()
+        log_queue = asyncio.Queue()
+        api_semaphore = asyncio.Semaphore(10)
+        _log_worker_task = asyncio.create_task(log_worker())
 
-
-@client.event
-async def on_ready():
-    await init_db()
     log.info("Logged in as %s", client.user)
 
 
@@ -78,7 +105,7 @@ async def on_message(message):
     )
 
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with db_lock:
             await db.execute(
                 "INSERT OR REPLACE INTO messages "
                 "(message_id, author, channel, content, attachments, created_at) "
@@ -107,7 +134,7 @@ async def on_message(message):
 @client.event
 async def on_message_delete(message):
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with db_lock:
             async with db.execute(
                 "SELECT author, channel, content, attachments, created_at "
                 "FROM messages WHERE message_id = ?",
@@ -115,28 +142,27 @@ async def on_message_delete(message):
             ) as cursor:
                 row = await cursor.fetchone()
 
-            if row:
-                author, channel, content, attachments, created_at = row
+        if row:
+            author, channel, content, attachments, created_at = row
 
-                log_text = (
-                    f"**Message Deleted**\n"
-                    f"**Author:** {author}\n"
-                    f"**Channel:** {channel}\n"
-                    f"**Content:** {content or '*empty*'}\n"
-                    f"**Original timestamp:** {created_at}"
-                )
+            log_text = (
+                f"**Message Deleted**\n"
+                f"**Author:** {author}\n"
+                f"**Channel:** {channel}\n"
+                f"**Content:** {content or '*empty*'}\n"
+                f"**Original timestamp:** {created_at}"
+            )
 
-                files = []
-                if attachments:
-                    for filename in attachments.split(","):
-                        path = f"media/{message.id}_{filename}"
-                        if os.path.exists(path):
-                            files.append(discord.File(path, filename=filename))
+            files = []
+            if attachments:
+                for filename in attachments.split(","):
+                    path = f"media/{message.id}_{filename}"
+                    if os.path.exists(path):
+                        files.append(discord.File(path, filename=filename))
 
-                log_channel = client.get_channel(LOG_CHANNEL_ID)
-                if log_channel:
-                    await send_long_message(log_channel, log_text, files=files)
+            await log_queue.put((log_text, files))
 
+            async with db_lock:
                 await db.execute(
                     "DELETE FROM messages WHERE message_id = ?", (message.id,)
                 )
@@ -148,30 +174,29 @@ async def on_message_delete(message):
 @client.event
 async def on_message_edit(before, after):
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with db_lock:
             async with db.execute(
                 "SELECT content FROM messages WHERE message_id = ?",
                 (before.id,),
             ) as cursor:
                 row = await cursor.fetchone()
 
-            old_content = row[0] if row else str(before.content)
+        old_content = row[0] if row else str(before.content)
 
-            if old_content == after.content:
-                return
+        if old_content == after.content:
+            return
 
-            log_text = (
-                f"**Message Edited**\n"
-                f"**Author:** {after.author}\n"
-                f"**Channel:** {after.channel}\n"
-                f"**Before:** {old_content or '*empty*'}\n"
-                f"**After:** {after.content or '*empty*'}"
-            )
+        log_text = (
+            f"**Message Edited**\n"
+            f"**Author:** {after.author}\n"
+            f"**Channel:** {after.channel}\n"
+            f"**Before:** {old_content or '*empty*'}\n"
+            f"**After:** {after.content or '*empty*'}"
+        )
 
-            log_channel = client.get_channel(LOG_CHANNEL_ID)
-            if log_channel:
-                await send_long_message(log_channel, log_text)
+        await log_queue.put((log_text, None))
 
+        async with db_lock:
             await db.execute(
                 "UPDATE messages SET content = ? WHERE message_id = ?",
                 (after.content, after.id),
