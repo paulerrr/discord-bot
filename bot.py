@@ -23,6 +23,14 @@ GUILD_IDS = (
     else None
 )
 
+MIRROR_CHANNEL_ID = int(os.getenv("MIRROR_CHANNEL_ID", "0"))
+_raw_mirror_ids = os.getenv("MIRROR_SOURCE_IDS", "").strip()
+MIRROR_SOURCE_IDS = (
+    {int(cid) for cid in _raw_mirror_ids.split(",") if cid.strip()}
+    if _raw_mirror_ids
+    else set()
+)
+
 client = discord.Client()
 
 os.makedirs("media", exist_ok=True)
@@ -144,6 +152,23 @@ async def on_message(message):
             await attachment.save(file_name)
         except Exception:
             log.exception("Failed to save attachment %s", attachment.filename)
+
+    if MIRROR_CHANNEL_ID and message.channel.id in MIRROR_SOURCE_IDS:
+        mirror_ch = client.get_channel(MIRROR_CHANNEL_ID)
+        if mirror_ch:
+            header = f"**[#{message.channel.name}]** {message.author} ({message.created_at.strftime('%Y-%m-%d %H:%M')}):"
+            mirror_text = f"{header}\n{message.content}" if message.content else header
+
+            mirror_files = []
+            for attachment in message.attachments:
+                path = f"media/{message.id}_{attachment.filename}"
+                if os.path.exists(path):
+                    mirror_files.append(discord.File(path, filename=attachment.filename))
+
+            try:
+                await send_long_message(mirror_ch, mirror_text, files=mirror_files or None)
+            except Exception:
+                log.exception("Failed to mirror message %s", message.id)
 
 
 @client.event
